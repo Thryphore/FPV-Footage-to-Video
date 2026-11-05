@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+# Local triage outputs / caches
+test_data/keepers/
+test_data/ai_out/
+test_data/ai_in/
+*.mp4
+!test_data/sd_card/*.mp4
+
