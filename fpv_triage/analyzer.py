@@ -28,8 +28,6 @@ VIDEO_EXTENSIONS = {
 class FlightAnalysis:
     path: str
     duration_seconds: float
-    flight_seconds: float
-    longest_flight_seconds: float
     sample_count: int
     mean_motion: float
     peak_motion: float
@@ -38,7 +36,10 @@ class FlightAnalysis:
     keep: bool
     reason: str
     description: str = ""
+    environment_tag: str = ""
     notes_path: str | None = None
+    # Step timings in seconds — for app/CLI display only, not the notes file.
+    timing: dict[str, float] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,13 +47,19 @@ class FlightAnalysis:
 
 @dataclass
 class AnalyzerConfig:
-    min_flight_seconds: float = 10.0
+    # Keep once we have this much flight AND this much video left after that point.
+    proof_flight_seconds: float = 5.0
+    remaining_after_proof: float = 15.0
     sample_fps: float = 2.0
     # Absolute mean optical-flow magnitude. Static bench footage is usually
     # ~0.05; sustained FPV flight is typically well above 1.0 at 2 sample-fps.
     motion_threshold: float = 0.8
     gap_seconds: float = 1.5
     analyze_width: int = 320
+
+    @property
+    def min_duration_seconds(self) -> float:
+        return self.proof_flight_seconds + self.remaining_after_proof
 
 
 def _open_capture(path: Path) -> cv2.VideoCapture:
@@ -80,35 +87,74 @@ def _resize_gray(frame: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(gray, (width, new_h), interpolation=cv2.INTER_AREA)
 
 
+def probe_duration(path: Path) -> float:
+    """Read duration from container metadata without decoding frames."""
+    cap = _open_capture(path)
+    try:
+        _fps, duration, _frame_count = _video_meta(cap)
+        if duration > 0:
+            return duration
+        msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+        return max(0.0, msec / 1000.0) if msec > 0 else 0.0
+    finally:
+        cap.release()
+
+
+def _read_frame_at(cap: cv2.VideoCapture, frame_index: int) -> np.ndarray | None:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+    ok, frame = cap.read()
+    return frame if ok else None
+
+
 def _motion_series(
     path: Path,
-    sample_fps: float,
-    analyze_width: int,
-) -> tuple[float, list[float], list[float]]:
-    """Return duration, sample timestamps (sec), and per-step motion magnitudes."""
+    config: AnalyzerConfig,
+) -> tuple[float, list[float], bool, str]:
+    """
+    Sample motion and decide keep/reject.
+
+    Keep as soon as proof_flight_seconds of flight is reached AND
+    remaining video after that timestamp is >= remaining_after_proof.
+    """
     cap = _open_capture(path)
     try:
         fps, duration, frame_count = _video_meta(cap)
         if duration <= 0 and frame_count <= 0:
-            duration = 0.0
+            return 0.0, [], False, "unreadable: no frames"
 
-        step = max(1, int(round(fps / max(sample_fps, 0.1))))
-        timestamps: list[float] = []
+        step = max(1, int(round(fps / max(config.sample_fps, 0.1))))
+        sample_dt = 1.0 / max(config.sample_fps, 0.1)
         motions: list[float] = []
         prev_gray: np.ndarray | None = None
-        index = 0
+        prev_t: float | None = None
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if index % step != 0:
+        flight_total = 0.0
+        stretch = 0.0
+        gap_budget = 0.0
+
+        if frame_count > 0:
+            sample_indexes = list(range(0, frame_count, step))
+        else:
+            sample_indexes = []
+            index = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if index % step == 0:
+                    sample_indexes.append(index)
                 index += 1
-                continue
+            if duration <= 0 and index > 0:
+                duration = index / fps
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-            t = index / fps
-            gray = _resize_gray(frame, analyze_width)
-            if prev_gray is not None:
+        for frame_index in sample_indexes:
+            frame = _read_frame_at(cap, frame_index)
+            if frame is None:
+                continue
+            t = frame_index / fps
+            gray = _resize_gray(frame, config.analyze_width)
+            if prev_gray is not None and prev_t is not None:
                 flow = cv2.calcOpticalFlowFarneback(
                     prev_gray,
                     gray,
@@ -122,63 +168,49 @@ def _motion_series(
                     0,
                 )
                 mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-                motions.append(float(np.mean(mag)))
-                timestamps.append(t)
-            prev_gray = gray
-            index += 1
+                motion = float(np.mean(mag))
+                motions.append(motion)
 
-        if duration <= 0:
-            duration = index / fps if fps > 0 else 0.0
-        return duration, timestamps, motions
+                dt = max(sample_dt * 0.5, t - prev_t)
+                if motion >= config.motion_threshold:
+                    stretch += dt + gap_budget
+                    gap_budget = 0.0
+                    flight_total += dt
+                    remaining = duration - t
+                    if (
+                        flight_total >= config.proof_flight_seconds
+                        and remaining >= config.remaining_after_proof
+                    ):
+                        reason = (
+                            f"keep: {config.proof_flight_seconds:.0f}s flight proven "
+                            f"with {remaining:.0f}s left"
+                        )
+                        return duration, motions, True, reason
+                elif stretch > 0:
+                    gap_budget += dt
+                    if gap_budget > config.gap_seconds:
+                        stretch = 0.0
+                        gap_budget = 0.0
+
+            prev_gray = gray
+            prev_t = t
+
+        if duration <= 0 and prev_t is not None:
+            duration = prev_t
+
+        reason = (
+            f"reject: never got {config.proof_flight_seconds:.0f}s flight "
+            f"with {config.remaining_after_proof:.0f}s remaining"
+        )
+        return duration, motions, False, reason
     finally:
         cap.release()
-
-
-def _flight_seconds_from_motion(
-    timestamps: list[float],
-    motions: list[float],
-    motion_threshold: float,
-    gap_seconds: float,
-    sample_fps: float,
-) -> tuple[float, float, float]:
-    """Return (total_flight_seconds, longest_stretch, mean_motion)."""
-    if not motions:
-        return 0.0, 0.0, 0.0
-
-    mean_motion = float(np.mean(motions))
-    sample_dt = 1.0 / max(sample_fps, 0.1)
-    flying = [m >= motion_threshold for m in motions]
-
-    total = 0.0
-    longest = 0.0
-    stretch = 0.0
-    gap_budget = 0.0
-
-    for i, is_flying in enumerate(flying):
-        dt = sample_dt
-        if i > 0:
-            dt = max(sample_dt * 0.5, timestamps[i] - timestamps[i - 1])
-
-        if is_flying:
-            stretch += dt + gap_budget
-            gap_budget = 0.0
-            total += dt
-            longest = max(longest, stretch)
-        elif stretch > 0:
-            gap_budget += dt
-            if gap_budget > gap_seconds:
-                stretch = 0.0
-                gap_budget = 0.0
-
-    return total, longest, mean_motion
 
 
 def _empty_analysis(path: Path, reason: str, **kwargs) -> FlightAnalysis:
     base = {
         "path": str(path),
         "duration_seconds": 0.0,
-        "flight_seconds": 0.0,
-        "longest_flight_seconds": 0.0,
         "sample_count": 0,
         "mean_motion": 0.0,
         "peak_motion": 0.0,
@@ -197,51 +229,34 @@ def analyze_video(path: Path, config: AnalyzerConfig | None = None) -> FlightAna
     path = Path(path)
 
     try:
-        duration, timestamps, motions = _motion_series(
-            path, cfg.sample_fps, cfg.analyze_width
-        )
-    except Exception as exc:  # noqa: BLE001 - surface as reject reason
+        duration = probe_duration(path)
+    except Exception as exc:  # noqa: BLE001
         return _empty_analysis(path, f"unreadable: {exc}")
 
-    overall, top, mean_flight, peak = speed_scores_from_motions(
+    # Instant reject when the file cannot possibly satisfy proof + remaining.
+    if 0 < duration < cfg.min_duration_seconds:
+        return _empty_analysis(
+            path,
+            (
+                f"too short ({duration:.1f}s < "
+                f"{cfg.min_duration_seconds:.0f}s needed)"
+            ),
+            duration_seconds=round(duration, 2),
+        )
+
+    try:
+        duration, motions, keep, reason = _motion_series(path, cfg)
+    except Exception as exc:  # noqa: BLE001
+        return _empty_analysis(path, f"unreadable: {exc}")
+
+    overall, top, _mean_flight, peak = speed_scores_from_motions(
         motions, cfg.motion_threshold
     )
     mean_motion = float(np.mean(motions)) if motions else 0.0
 
-    if duration < cfg.min_flight_seconds:
-        return _empty_analysis(
-            path,
-            f"too short ({duration:.1f}s < {cfg.min_flight_seconds:.0f}s)",
-            duration_seconds=round(duration, 2),
-            sample_count=len(motions),
-            mean_motion=round(mean_motion, 3),
-            peak_motion=peak,
-            overall_speed_score=overall,
-            top_speed_score=top,
-        )
-
-    flight_seconds, longest, _ = _flight_seconds_from_motion(
-        timestamps,
-        motions,
-        cfg.motion_threshold,
-        cfg.gap_seconds,
-        cfg.sample_fps,
-    )
-
-    keep = flight_seconds >= cfg.min_flight_seconds
-    if keep:
-        reason = f"keep: {flight_seconds:.1f}s flight (longest stretch {longest:.1f}s)"
-    else:
-        reason = (
-            f"reject: only {flight_seconds:.1f}s flight "
-            f"(need {cfg.min_flight_seconds:.0f}s)"
-        )
-
     return FlightAnalysis(
         path=str(path),
         duration_seconds=round(duration, 2),
-        flight_seconds=round(flight_seconds, 2),
-        longest_flight_seconds=round(longest, 2),
         sample_count=len(motions),
         mean_motion=round(mean_motion, 3),
         peak_motion=peak,

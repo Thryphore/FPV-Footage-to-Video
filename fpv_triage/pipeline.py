@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,35 +58,57 @@ def run_triage(
         if on_progress:
             on_progress(index, total, video.name)
 
+        timing: dict[str, float] = {}
+        t_clip = time.perf_counter()
+
+        t0 = time.perf_counter()
         analysis = analyze_video(video, config)
+        timing["analyze"] = time.perf_counter() - t0
+
         copied_to: str | None = None
         notes_path: str | None = None
 
         if analysis.keep:
             kept += 1
             if not dry_run:
+                t1 = time.perf_counter()
                 dest = copy_keeper(video, output)
+                timing["copy"] = time.perf_counter() - t1
                 copied_to = str(dest)
 
             if describe and describer is not None:
                 if on_progress:
                     on_progress(index, total, f"Describing {video.name}")
                 try:
-                    description = describer.describe(video)
+                    notes = describer.describe(video)
+                    if notes.load_seconds > 0.05:
+                        timing["model_load"] = notes.load_seconds
+                    timing["keyframes"] = notes.keyframe_seconds
+                    timing["inference"] = notes.inference_seconds
+                    analysis.environment_tag = notes.environment_tag
+                    analysis.description = notes.movement
                 except Exception as exc:  # noqa: BLE001
-                    description = f"Description failed: {exc}"
-                analysis.description = description
+                    analysis.environment_tag = "unknown"
+                    analysis.description = f"Description failed: {exc}"
 
-                # Sidecar next to the copy when possible; otherwise under output.
                 if copied_to:
                     txt_path = Path(copied_to).with_suffix(".txt")
                 else:
                     txt_path = Path(output) / f"{video.stem}.txt"
-                notes = write_notes_file(analysis, txt_path, description)
-                notes_path = str(notes)
+                notes_file = write_notes_file(
+                    analysis,
+                    txt_path,
+                    environment_tag=analysis.environment_tag,
+                    movement=analysis.description,
+                    video_path=Path(copied_to) if copied_to else video,
+                )
+                notes_path = str(notes_file)
                 analysis.notes_path = notes_path
         else:
             rejected += 1
+
+        timing["total"] = time.perf_counter() - t_clip
+        analysis.timing = {k: round(v, 3) for k, v in timing.items()}
 
         entry = analysis.to_dict()
         entry["copied_to"] = copied_to
@@ -95,6 +118,18 @@ def run_triage(
         if on_result:
             on_result(analysis, copied_to)
 
+    # Refresh searchable catalog + embeddings for the output folder.
+    if describe and kept > 0 and not (should_cancel and should_cancel()):
+        try:
+            from .catalog import rebuild_search_assets
+
+            if on_progress:
+                on_progress(total, total, "Building AI search index…")
+            rebuild_search_assets(output)
+        except Exception:
+            # Search index is optional; triage results still stand.
+            pass
+
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": str(Path(source).resolve()),
@@ -103,7 +138,8 @@ def run_triage(
         "describe": bool(describe),
         "cancelled": bool(should_cancel and should_cancel()),
         "config": {
-            "min_flight_seconds": config.min_flight_seconds,
+            "proof_flight_seconds": config.proof_flight_seconds,
+            "remaining_after_proof": config.remaining_after_proof,
             "sample_fps": config.sample_fps,
             "motion_threshold": config.motion_threshold,
             "gap_seconds": config.gap_seconds,

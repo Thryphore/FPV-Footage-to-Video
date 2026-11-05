@@ -6,5 +6,6 @@ pillow>=10.0.0
 transformers>=4.49.0
 accelerate>=0.33.0
 qwen-vl-utils>=0.0.8
+sentence-transformers>=3.0.0
 # Install CUDA torch separately if needed:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
