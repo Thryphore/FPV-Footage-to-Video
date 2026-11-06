@@ -48,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--motion-threshold",
         type=float,
-        default=0.8,
-        help="Optical-flow magnitude treated as flight (default: 0.8)",
+        default=6.0,
+        help="Frame-diff motion treated as flight (default: 6.0)",
     )
     p.add_argument(
         "--gap-seconds",
@@ -63,9 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated video extensions",
     )
     p.add_argument(
+        "--copy-videos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Copy keeper MP4s into --output (use --no-copy-videos for notes only)",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Analyze and report without copying files",
+        help="Same as --no-copy-videos (notes/report only, leave videos on source)",
     )
     p.add_argument(
         "--describe",
@@ -154,8 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{config.remaining_after_proof:.0f}s remaining "
         f"(threshold={config.motion_threshold})"
     )
-    if args.dry_run:
-        print("Dry run: no files will be copied")
+    copy_videos = bool(args.copy_videos) and not bool(args.dry_run)
+    if not copy_videos:
+        print("Notes only: keeper videos will not be copied")
 
     bar: tqdm | None = None
 
@@ -178,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
 
         name = Path(analysis.path).name
         if analysis.keep:
-            dest = Path(copied_to).name if copied_to else "(dry run)"
+            dest = Path(copied_to).name if copied_to else "(notes only)"
             emit(
                 f"KEEP  {name} -> {dest}  "
                 f"(speed {analysis.overall_speed_score:.1f}/10, "
@@ -186,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if analysis.environment_tag:
                 emit(f"      env: {analysis.environment_tag}")
+            if analysis.people:
+                emit(f"      people: {analysis.people}")
+            if analysis.action:
+                emit(f"      action: {analysis.action}")
             if analysis.description:
                 preview = analysis.description.replace("\n", " ")
                 if len(preview) > 140:
@@ -202,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
             source,
             output,
             config,
-            dry_run=args.dry_run,
+            copy_videos=copy_videos,
             describe=bool(args.describe),
             model_id=args.model,
             extensions=extensions,

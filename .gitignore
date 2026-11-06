@@ -13,3 +13,7 @@ test_data/ai_in/
 *.mp4
 !test_data/sd_card/*.mp4
 
+
+yolov8n.pt
+runs/
+_debug_frames*/

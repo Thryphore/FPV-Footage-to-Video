@@ -30,6 +30,8 @@ class ClipRecord:
     environment: str
     movement: str
     search_text: str
+    people: str = "none"
+    action: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -37,6 +39,8 @@ class ClipRecord:
 
 def _parse_notes_txt(text: str) -> dict:
     env = ""
+    people = "none"
+    action = ""
     movement = ""
     duration = 0.0
     overall = 0.0
@@ -46,6 +50,14 @@ def _parse_notes_txt(text: str) -> dict:
     env_m = re.search(r"(?im)^\s*Environment\s*:\s*(.+)$", text)
     if env_m:
         env = env_m.group(1).strip()
+
+    people_m = re.search(r"(?im)^\s*People\s*:\s*(.+)$", text)
+    if people_m:
+        people = people_m.group(1).strip() or "none"
+
+    action_m = re.search(r"(?im)^\s*Action\s*:\s*(.+)$", text)
+    if action_m:
+        action = action_m.group(1).strip()
 
     file_m = re.search(r"(?im)^\s*File\s*:\s*(.+)$", text)
     if file_m:
@@ -81,6 +93,8 @@ def _parse_notes_txt(text: str) -> dict:
         "overall_speed_score": overall,
         "top_speed_score": top,
         "environment": env or "unknown",
+        "people": people or "none",
+        "action": action,
         "movement": movement or "",
     }
 
@@ -95,8 +109,16 @@ def write_clip_json(
     top_speed_score: float,
     environment: str,
     movement: str,
+    people: str = "none",
+    action: str = "",
 ) -> Path:
     """Machine-readable sidecar for AI search / agents."""
+    from .describer import compose_search_blob
+
+    people = (people or "none").strip()
+    action = (action or "").strip()
+    environment = (environment or "unknown").strip()
+    movement = (movement or "").strip()
     record = ClipRecord(
         file=video_path.name,
         video_path=str(video_path),
@@ -105,11 +127,11 @@ def write_clip_json(
         duration_seconds=float(duration_seconds),
         overall_speed_score=float(overall_speed_score),
         top_speed_score=float(top_speed_score),
-        environment=(environment or "unknown").strip(),
-        movement=(movement or "").strip(),
-        search_text=(
-            f"{environment or 'unknown'}. {movement or ''}".strip()
-        ),
+        environment=environment,
+        people=people,
+        action=action,
+        movement=movement,
+        search_text=compose_search_blob(environment, people, action, movement),
     )
     dest_json.parent.mkdir(parents=True, exist_ok=True)
     dest_json.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
@@ -137,8 +159,14 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
         video_path = Path(data.get("video_path") or (output_dir / file_name))
         notes_path = Path(data.get("notes_path") or video_path.with_suffix(".txt"))
         env = data.get("environment") or "unknown"
+        people = data.get("people") or "none"
+        action = data.get("action") or ""
         movement = data.get("movement") or data.get("description") or ""
-        search_text = data.get("search_text") or f"{env}. {movement}".strip()
+        from .describer import compose_search_blob
+
+        search_text = data.get("search_text") or compose_search_blob(
+            env, people, action, movement
+        )
         key = str(video_path.resolve()) if video_path.exists() else json_path.stem
         if key in seen:
             continue
@@ -153,6 +181,8 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
                 overall_speed_score=float(data.get("overall_speed_score") or 0.0),
                 top_speed_score=float(data.get("top_speed_score") or 0.0),
                 environment=env,
+                people=people,
+                action=action,
                 movement=movement,
                 search_text=search_text,
             )
@@ -177,8 +207,12 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
             continue
         seen.add(key)
         env = parsed["environment"]
+        people = parsed.get("people") or "none"
+        action = parsed.get("action") or ""
         movement = parsed["movement"]
         json_path = txt_path.with_suffix(".json")
+        from .describer import compose_search_blob
+
         records.append(
             ClipRecord(
                 file=parsed["file"] or video.name,
@@ -189,8 +223,10 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
                 overall_speed_score=parsed["overall_speed_score"],
                 top_speed_score=parsed["top_speed_score"],
                 environment=env,
+                people=people,
+                action=action,
                 movement=movement,
-                search_text=f"{env}. {movement}".strip(),
+                search_text=compose_search_blob(env, people, action, movement),
             )
         )
 
@@ -289,7 +325,10 @@ class NotesSearchIndex:
         def keyword_score(record: ClipRecord) -> float:
             if not tokens:
                 return 0.0
-            hay = f"{record.search_text} {record.movement} {record.environment} {record.file}".lower()
+            hay = (
+                f"{record.search_text} {record.movement} {record.environment} "
+                f"{record.people} {record.action} {record.file}"
+            ).lower()
             hits = sum(1 for t in tokens if t in hay)
             return hits / len(tokens)
 

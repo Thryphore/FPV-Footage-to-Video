@@ -9,17 +9,16 @@ import numpy as np
 
 def motion_to_score(motion: float) -> float:
     """
-    Convert mean Farneback magnitude (at ~2 sample-fps, 320px wide) to 1-10.
+    Convert mean abs frame-diff (0–255 gray @ ~160px, 2 sample-fps) to 1–10.
 
-    Real FPV (fisheye, near ground) produces large pixel flow even at a crawl,
-    so the curve is intentionally soft. Rough guide:
-      ~1   almost still / hover
-      ~4   slow cruise / park flying
-      ~10  normal freestyle pace
-      ~20+ ripping / proximity
+    Rough guide for FPV:
+      ~2    almost still / hover
+      ~8    slow cruise / park flying
+      ~18   normal freestyle pace
+      ~35+  ripping / proximity
     """
     m = max(0.0, float(motion))
-    score = 1.0 + 9.0 * (1.0 - math.exp(-m / 10.0))
+    score = 1.0 + 9.0 * (1.0 - math.exp(-m / 18.0))
     return round(min(10.0, max(1.0, score)), 1)
 
 

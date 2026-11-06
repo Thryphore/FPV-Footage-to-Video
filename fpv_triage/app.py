@@ -13,6 +13,7 @@ from .analyzer import AnalyzerConfig, FlightAnalysis
 from .catalog import NotesSearchIndex, rebuild_search_assets
 from .describer import format_timing_line
 from .pipeline import run_triage
+from .scanner import delete_lrf_files, find_lrf_files
 
 
 ctk.set_appearance_mode("System")
@@ -34,8 +35,8 @@ class FpvTriageApp(ctk.CTk):
         self.output_var = ctk.StringVar(
             value=str(Path.home() / "Videos" / "fpv-keepers")
         )
-        self.threshold_var = ctk.StringVar(value="0.8")
-        self.dry_run_var = ctk.BooleanVar(value=False)
+        self.threshold_var = ctk.StringVar(value="6.0")
+        self.copy_videos_var = ctk.BooleanVar(value=True)
         self.describe_var = ctk.BooleanVar(value=True)
         self.status_var = ctk.StringVar(value="Pick a source folder, then hit Start.")
         self.search_query_var = ctk.StringVar()
@@ -109,8 +110,8 @@ class FpvTriageApp(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkCheckBox(
             checks,
-            text="Dry run (analyze only, don't copy)",
-            variable=self.dry_run_var,
+            text="Copy videos to output (off = notes only)",
+            variable=self.copy_videos_var,
         ).pack(anchor="w", pady=(8, 0))
 
         buttons = ctk.CTkFrame(form, fg_color="transparent")
@@ -138,7 +139,17 @@ class FpvTriageApp(ctk.CTk):
             fg_color=("gray70", "gray30"),
             command=self._open_output,
         )
-        self.open_btn.pack(side="left")
+        self.open_btn.pack(side="left", padx=(0, 8))
+
+        self.lrf_btn = ctk.CTkButton(
+            buttons,
+            text="Delete .LRF files",
+            width=140,
+            fg_color=("#a33", "#722"),
+            hover_color=("#822", "#511"),
+            command=self._delete_lrf_files,
+        )
+        self.lrf_btn.pack(side="left")
 
         body = ctk.CTkFrame(tab)
         body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -255,6 +266,88 @@ class FpvTriageApp(ctk.CTk):
     def _set_running(self, running: bool) -> None:
         self.start_btn.configure(state="disabled" if running else "normal")
         self.cancel_btn.configure(state="normal" if running else "disabled")
+        self.lrf_btn.configure(state="disabled" if running else "normal")
+
+    def _delete_lrf_files(self) -> None:
+        source = Path(self.source_var.get().strip())
+        if not source.exists() or not source.is_dir():
+            messagebox.showerror(
+                "Delete .LRF",
+                "Choose a valid Source folder/drive first (SD card or footage folder).",
+            )
+            return
+
+        try:
+            files = find_lrf_files(source)
+        except OSError as exc:
+            messagebox.showerror("Delete .LRF", str(exc))
+            return
+
+        if not files:
+            messagebox.showinfo("Delete .LRF", f"No .LRF files found under:\n{source}")
+            return
+
+        total_bytes = 0
+        for path in files:
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+        size_mb = total_bytes / (1024 * 1024)
+        ok = messagebox.askyesno(
+            "Delete .LRF",
+            f"Delete {len(files)} DJI .LRF file(s) (~{size_mb:.1f} MB) under:\n"
+            f"{source}\n\n"
+            "These are low-res proxy files. Videos (.MP4) are not touched.",
+        )
+        if not ok:
+            return
+
+        self.lrf_btn.configure(state="disabled")
+        self.status_var.set(f"Deleting {len(files)} .LRF file(s)…")
+
+        def worker() -> None:
+            try:
+                deleted, failed = delete_lrf_files(source)
+                self.after(0, lambda: self._on_lrf_deleted(deleted, failed))
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._on_lrf_error(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_lrf_deleted(
+        self, deleted: list[Path], failed: list[tuple[Path, str]]
+    ) -> None:
+        self.lrf_btn.configure(state="normal")
+        self._append_log("")
+        self._append_log(f"Deleted {len(deleted)} .LRF file(s).")
+        for path in deleted[:20]:
+            self._append_log(f"  - {path}")
+        if len(deleted) > 20:
+            self._append_log(f"  … and {len(deleted) - 20} more")
+        for path, err in failed:
+            self._append_log(f"  FAILED {path}: {err}")
+
+        if failed:
+            self.status_var.set(
+                f"Deleted {len(deleted)} .LRF file(s); {len(failed)} failed."
+            )
+            messagebox.showwarning(
+                "Delete .LRF",
+                f"Deleted {len(deleted)} file(s).\n"
+                f"{len(failed)} could not be removed (see log).",
+            )
+        else:
+            self.status_var.set(f"Deleted {len(deleted)} .LRF file(s).")
+            messagebox.showinfo(
+                "Delete .LRF",
+                f"Removed {len(deleted)} .LRF file(s) from the source folder.",
+            )
+
+    def _on_lrf_error(self, exc: Exception) -> None:
+        self.lrf_btn.configure(state="normal")
+        self.status_var.set("Delete .LRF failed.")
+        messagebox.showerror("Delete .LRF", str(exc))
 
     def _request_cancel(self) -> None:
         self._cancel.set()
@@ -290,15 +383,15 @@ class FpvTriageApp(ctk.CTk):
         self.log.configure(state="disabled")
         self._append_log(f"Source: {source}")
         self._append_log(f"Output: {output}")
+        copy_videos = bool(self.copy_videos_var.get())
         self._append_log(
             f"Keep rule: 5s flight + 15s remaining  |  threshold={threshold}"
             + ("  |  AI descriptions ON" if self.describe_var.get() else "  |  AI descriptions OFF")
-            + ("  |  DRY RUN" if self.dry_run_var.get() else "")
+            + ("  |  copy videos ON" if copy_videos else "  |  notes only (no video copy)")
         )
         self._append_log("")
 
         config = AnalyzerConfig(motion_threshold=threshold)
-        dry_run = bool(self.dry_run_var.get())
         describe = bool(self.describe_var.get())
 
         def worker() -> None:
@@ -314,7 +407,7 @@ class FpvTriageApp(ctk.CTk):
                     source,
                     output,
                     config,
-                    dry_run=dry_run,
+                    copy_videos=copy_videos,
                     describe=describe,
                     should_cancel=self._cancel.is_set,
                     on_progress=lambda i, total, name: self.after(
@@ -347,7 +440,12 @@ class FpvTriageApp(ctk.CTk):
         name = Path(analysis.path).name
         timing = format_timing_line(analysis.timing)
         if analysis.keep:
-            dest = Path(copied_to).name if copied_to else "(dry run)"
+            if copied_to:
+                dest = Path(copied_to).name
+            elif self.copy_videos_var.get():
+                dest = "(copy pending/failed)"
+            else:
+                dest = "(notes only)"
             self._append_log(
                 f"KEEP  {name}  ->  {dest}  "
                 f"(speed {analysis.overall_speed_score:.1f}/10, "
@@ -355,6 +453,10 @@ class FpvTriageApp(ctk.CTk):
             )
             if analysis.environment_tag:
                 self._append_log(f"      env: {analysis.environment_tag}")
+            if analysis.people:
+                self._append_log(f"      people: {analysis.people}")
+            if analysis.action:
+                self._append_log(f"      action: {analysis.action}")
             if analysis.description:
                 preview = analysis.description.replace("\n", " ")
                 if len(preview) > 160:
@@ -389,11 +491,17 @@ class FpvTriageApp(ctk.CTk):
             self.search_status_var.set(
                 f"Indexed keepers in {self.output_var.get()}. Try the AI Search tab."
             )
-        if not cancelled and summary.kept and not self.dry_run_var.get():
+        if not cancelled and summary.kept:
+            if self.copy_videos_var.get():
+                detail = f"Copied videos + notes to:\n{self.output_var.get()}"
+            else:
+                detail = (
+                    f"Notes only (videos left on source) in:\n{self.output_var.get()}"
+                )
             messagebox.showinfo(
                 "Triage complete",
                 f"Kept {summary.kept} of {summary.scanned} clips.\n\n"
-                f"Copied to:\n{self.output_var.get()}\n\n"
+                f"{detail}\n\n"
                 "Notes are searchable on the AI Search tab.",
             )
 
@@ -479,6 +587,10 @@ class FpvTriageApp(ctk.CTk):
                 f"speed {record.overall_speed_score:.1f}/{record.top_speed_score:.1f}"
             )
             self._append_search(f"   env: {record.environment}")
+            if record.people:
+                self._append_search(f"   people: {record.people}")
+            if record.action:
+                self._append_search(f"   action: {record.action}")
             move = record.movement.replace("\n", " ")
             if len(move) > 180:
                 move = move[:177] + "..."

@@ -21,7 +21,7 @@ python -m fpv_triage
 1. Browse to your SD card / footage folder  
 2. Choose an output folder on the PC (default: `Videos\fpv-keepers`)  
 3. Leave **AI descriptions** on to write a `.txt` notes file next to each keeper  
-4. Optional: enable **Dry run** to preview without copying video files (notes still write)  
+4. Optional: uncheck **Copy videos to output** to write notes/search files only (videos stay on the SD card)  
 5. Click **Start triage**
 
 First AI run downloads **Qwen3-VL-4B-Instruct** to your Hugging Face cache (one-time).
@@ -36,7 +36,7 @@ First AI run downloads **Qwen3-VL-4B-Instruct** to your Hugging Face cache (one-
 6. For keepers, a local vision model describes the clip for later editing.
 7. Copies keepers into the output folder, writes matching `.txt` notes, and `triage_report.json`.
 
-Tune **Motion threshold** if your camera is noisier or smoother than typical FPV. Higher = stricter.
+Tune **Motion threshold** if your camera is noisier or smoother than typical FPV. Higher = stricter (default `6.0` on the cheap frame-diff analyzer).
 
 ### Notes file example
 
@@ -45,10 +45,13 @@ File: DJI_0023.mp4
 Duration: 48.2s
 Overall speed score: 6.4 / 10
 Top speed score: 8.1 / 10
-Environment: tree line park
+Environment: grassy park playground
+People: kids chasing the drone near playground
+Action: rolls, flips, slow cruise
 
 Movement:
-Slow cruise at canopy height, yaw left around a trunk, then a short dive toward grass.
+Opens with a slow cruise over grass, then kids run after the drone. Mid-clip has a roll and flip
+over the playground, then a yaw turn back toward the spectators.
 ```
 
 ## AI search
@@ -71,5 +74,6 @@ python -m fpv_triage --cli --output C:\Users\awitt\Videos\fpv-keepers --search "
 
 ```powershell
 python -m fpv_triage --cli --source E:\DCIM --output C:\Users\awitt\Videos\fpv-keepers
-python -m fpv_triage --cli --source E:\DCIM --output C:\Users\awitt\Videos\fpv-keepers --dry-run
+python -m fpv_triage --cli --source E:\DCIM --output C:\Users\awitt\Videos\fpv-keepers --no-copy-videos
 ```
+
