@@ -6,6 +6,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Regenerated local launch tools / stamped runtime host
+fpv_triage_host.exe
+tools/rcedit-x64.exe
+app_runtime/
+
 # Local triage outputs / caches
 test_data/keepers/
 test_data/ai_out/
@@ -15,5 +20,6 @@ test_data/ai_in/
 
 
 yolov8n.pt
+yolo26n.pt
 runs/
 _debug_frames*/

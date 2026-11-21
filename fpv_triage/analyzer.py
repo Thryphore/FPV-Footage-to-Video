@@ -55,11 +55,18 @@ class FlightAnalysis:
     people: str = ""
     action: str = ""
     notes_path: str | None = None
+    # Motion series retained for coolest-window / crash heuristics.
+    motion_samples: list[float] | None = None
+    motion_times: list[float] | None = None
     # Step timings in seconds — for app/CLI display only, not the notes file.
     timing: dict[str, float] | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        # Keep triage_report.json lighter; full samples live in clip JSON via edit signals.
+        data.pop("motion_samples", None)
+        data.pop("motion_times", None)
+        return data
 
 
 @dataclass
@@ -187,10 +194,14 @@ def _motion_series_ffmpeg(
     duration: float,
     src_w: int,
     src_h: int,
-) -> tuple[float, list[float], bool, str] | None:
+    *,
+    full_motion: bool = False,
+) -> tuple[float, list[float], list[float], bool, str] | None:
     """
     Decode tiny gray frames via bundled ffmpeg (scale+fps in one pass).
     Much faster than OpenCV full-res decode on DJI 4K.
+
+    Returns (duration, motions, sample_times, keep, reason) or None.
     """
     exe = _ffmpeg_exe()
     if not exe:
@@ -252,7 +263,9 @@ def _motion_series_ffmpeg(
             if not raw or len(raw) < frame_bytes:
                 break
             t = index * sample_dt
-            if max_t is not None and t > max_t:
+            # Before keep is proven, stop once remaining-time rule can't pass.
+            # With full_motion, continue after keep for coolest-window / crash tags.
+            if max_t is not None and t > max_t and not kept:
                 break
 
             gray = np.frombuffer(raw, dtype=np.uint8).reshape((height, width))
@@ -260,12 +273,14 @@ def _motion_series_ffmpeg(
                 motion = _frame_motion(prev_gray, gray)
                 motions.append(motion)
                 sample_times.append(t)
-                keep, reason, _flight = _decide_from_motions(
-                    motions, sample_times, duration, config
-                )
-                if keep:
-                    kept = True
-                    break
+                if not kept:
+                    keep, reason, _flight = _decide_from_motions(
+                        motions, sample_times, duration, config
+                    )
+                    if keep:
+                        kept = True
+                        if not full_motion:
+                            break
             prev_gray = gray
             index += 1
     finally:
@@ -279,30 +294,33 @@ def _motion_series_ffmpeg(
             pass
 
     if kept:
-        return duration, motions, True, reason
+        return duration, motions, sample_times, True, reason
 
     keep, reason, _ = _decide_from_motions(motions, sample_times, duration, config)
-    return duration, motions, keep, reason
+    return duration, motions, sample_times, keep, reason
 
 
 def _motion_series_opencv(
     path: Path,
     config: AnalyzerConfig,
-) -> tuple[float, list[float], bool, str]:
+    *,
+    full_motion: bool = False,
+) -> tuple[float, list[float], list[float], bool, str]:
     """Fallback: sequential OpenCV decode (no random seeks)."""
     cap = _open_capture(path)
     try:
         fps, duration, frame_count = _video_meta(cap)
         if duration <= 0 and frame_count <= 0:
-            return 0.0, [], False, "unreadable: no frames"
+            return 0.0, [], [], False, "unreadable: no frames"
 
         step = max(1, int(round(fps / max(config.sample_fps, 0.1))))
-        sample_dt = step / fps
         motions: list[float] = []
         sample_times: list[float] = []
         prev_gray: np.ndarray | None = None
         frame_index = 0
         last_t = 0.0
+        kept = False
+        reason = ""
 
         while True:
             if frame_index % step != 0:
@@ -317,18 +335,25 @@ def _motion_series_opencv(
 
             t = frame_index / fps
             last_t = t
-            if duration > 0 and (duration - t) < config.remaining_after_proof:
+            if (
+                duration > 0
+                and (duration - t) < config.remaining_after_proof
+                and not kept
+            ):
                 break
 
             gray = _resize_gray(frame, config.analyze_width)
             if prev_gray is not None:
                 motions.append(_frame_motion(prev_gray, gray))
                 sample_times.append(t)
-                keep, reason, _ = _decide_from_motions(
-                    motions, sample_times, duration, config
-                )
-                if keep:
-                    return duration, motions, True, reason
+                if not kept:
+                    keep, reason, _ = _decide_from_motions(
+                        motions, sample_times, duration, config
+                    )
+                    if keep:
+                        kept = True
+                        if not full_motion:
+                            return duration, motions, sample_times, True, reason
 
             prev_gray = gray
             frame_index += 1
@@ -336,10 +361,12 @@ def _motion_series_opencv(
         if duration <= 0 and last_t > 0:
             duration = last_t
 
+        if kept:
+            return duration, motions, sample_times, True, reason
         keep, reason, _ = _decide_from_motions(
             motions, sample_times, duration, config
         )
-        return duration, motions, keep, reason
+        return duration, motions, sample_times, keep, reason
     finally:
         cap.release()
 
@@ -347,7 +374,9 @@ def _motion_series_opencv(
 def _motion_series(
     path: Path,
     config: AnalyzerConfig,
-) -> tuple[float, list[float], bool, str]:
+    *,
+    full_motion: bool = False,
+) -> tuple[float, list[float], list[float], bool, str]:
     """
     Sample motion and decide keep/reject.
 
@@ -363,16 +392,18 @@ def _motion_series(
             src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             if duration <= 0 and frame_count <= 0:
-                return 0.0, [], False, "unreadable: no frames"
+                return 0.0, [], [], False, "unreadable: no frames"
         finally:
             cap.release()
     except Exception:  # noqa: BLE001
-        return _motion_series_opencv(path, config)
+        return _motion_series_opencv(path, config, full_motion=full_motion)
 
-    fast = _motion_series_ffmpeg(path, config, duration, src_w, src_h)
+    fast = _motion_series_ffmpeg(
+        path, config, duration, src_w, src_h, full_motion=full_motion
+    )
     if fast is not None:
         return fast
-    return _motion_series_opencv(path, config)
+    return _motion_series_opencv(path, config, full_motion=full_motion)
 
 
 def _empty_analysis(path: Path, reason: str, **kwargs) -> FlightAnalysis:
@@ -391,7 +422,98 @@ def _empty_analysis(path: Path, reason: str, **kwargs) -> FlightAnalysis:
     return FlightAnalysis(**base)
 
 
-def analyze_video(path: Path, config: AnalyzerConfig | None = None) -> FlightAnalysis:
+def flight_proof_time_from_motions(
+    motions: list[float],
+    sample_times: list[float],
+    config: AnalyzerConfig,
+) -> float | None:
+    """
+    First sample time where cumulative in-flight seconds reach
+    ``proof_flight_seconds`` (same motion threshold / gap rules as triage).
+    Does not require remaining-after-proof — used for edit cut-ins.
+    """
+    flight_total = 0.0
+    stretch = 0.0
+    gap_budget = 0.0
+    prev_t: float | None = None
+    need = float(config.proof_flight_seconds)
+
+    for motion, t in zip(motions, sample_times):
+        dt = (t - prev_t) if prev_t is not None else (1.0 / max(config.sample_fps, 0.1))
+        dt = max(dt, 0.5 / max(config.sample_fps, 0.1))
+        prev_t = t
+
+        if motion >= config.motion_threshold:
+            stretch += dt + gap_budget
+            gap_budget = 0.0
+            flight_total += dt
+            if flight_total >= need:
+                return float(t)
+        elif stretch > 0:
+            gap_budget += dt
+            if gap_budget > config.gap_seconds:
+                stretch = 0.0
+                gap_budget = 0.0
+    return None
+
+
+def find_flight_proof_time(
+    path: Path,
+    config: AnalyzerConfig | None = None,
+) -> tuple[float | None, float, str]:
+    """
+    Locate when the clip has been in the air for ``proof_flight_seconds``.
+
+    Returns ``(start_s_or_None, duration_seconds, reason)``.
+
+    Uses the same motion threshold as triage, but does **not** require
+    remaining-after-proof — otherwise short keepers would never expose a cut-in.
+    """
+    cfg = config or AnalyzerConfig()
+    path = Path(path)
+    # remaining_after_proof=0 so sampling is not truncated to duration-15s
+    # (that triage cutoff would hide flight that starts later in short clips).
+    probe_cfg = AnalyzerConfig(
+        proof_flight_seconds=cfg.proof_flight_seconds,
+        remaining_after_proof=0.0,
+        sample_fps=cfg.sample_fps,
+        motion_threshold=cfg.motion_threshold,
+        gap_seconds=cfg.gap_seconds,
+        analyze_width=cfg.analyze_width,
+    )
+    try:
+        duration, motions, motion_times, _keep, _reason = _motion_series(
+            path, probe_cfg, full_motion=False
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, 0.0, f"unreadable: {exc}"
+
+    if not motions or not motion_times:
+        return None, float(duration or 0.0), "no motion samples"
+
+    start = flight_proof_time_from_motions(motions, motion_times, probe_cfg)
+    if start is None:
+        return (
+            None,
+            float(duration or 0.0),
+            (
+                f"never reached {cfg.proof_flight_seconds:.0f}s of flight "
+                f"(threshold={cfg.motion_threshold})"
+            ),
+        )
+    return (
+        float(start),
+        float(duration or 0.0),
+        f"flight proof at {start:.1f}s",
+    )
+
+
+def analyze_video(
+    path: Path,
+    config: AnalyzerConfig | None = None,
+    *,
+    full_motion: bool = False,
+) -> FlightAnalysis:
     """Score one video for whether it contains enough real flight."""
     cfg = config or AnalyzerConfig()
     path = Path(path)
@@ -413,7 +535,9 @@ def analyze_video(path: Path, config: AnalyzerConfig | None = None) -> FlightAna
         )
 
     try:
-        duration, motions, keep, reason = _motion_series(path, cfg)
+        duration, motions, motion_times, keep, reason = _motion_series(
+            path, cfg, full_motion=full_motion
+        )
     except Exception as exc:  # noqa: BLE001
         return _empty_analysis(path, f"unreadable: {exc}")
 
@@ -432,6 +556,8 @@ def analyze_video(path: Path, config: AnalyzerConfig | None = None) -> FlightAna
         top_speed_score=top,
         keep=keep,
         reason=reason,
+        motion_samples=list(motions) if motions else None,
+        motion_times=list(motion_times) if motion_times else None,
     )
 
 
@@ -469,9 +595,9 @@ def extract_keyframes(
     path: Path,
     count: int = 8,
     max_width: int = 768,
-) -> list:
+) -> tuple[list, list[float]]:
     """
-    Return RGB PIL images for the vision model.
+    Return (RGB PIL images, timestamps seconds) for the vision model.
 
     Prioritizes even time coverage (people / playground), then adds a few
     high-motion frames (rolls / flips).
@@ -548,7 +674,9 @@ def extract_keyframes(
                 picks = _pick_coverage_plus_motion(
                     scores, min(count, len(frames_rgb))
                 )
-                return [Image.fromarray(frames_rgb[i]) for i in picks]
+                dt = 1.0 / max(fps, 0.01)
+                times = [round(i * dt, 3) for i in picks]
+                return [Image.fromarray(frames_rgb[i]) for i in picks], times
 
     # Fallback: OpenCV even spacing.
     cap = _open_capture(path)
@@ -563,7 +691,7 @@ def extract_keyframes(
                 frames_bgr.append(frame)
             frame_count = len(frames_bgr)
             if frame_count == 0:
-                return []
+                return [], []
             indexes = np.linspace(
                 0, frame_count - 1, num=min(count, frame_count), dtype=int
             )
@@ -573,11 +701,14 @@ def extract_keyframes(
                 0, frame_count - 1, num=min(count, frame_count), dtype=int
             )
             picked = []
+            kept_indexes: list[int] = []
             for idx in indexes:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
                 ok, frame = cap.read()
                 if ok:
                     picked.append(frame)
+                    kept_indexes.append(int(idx))
+            indexes = np.asarray(kept_indexes, dtype=int)
 
         images = []
         for frame in picked:
@@ -587,6 +718,7 @@ def extract_keyframes(
                 new_h = max(1, int(round(h * (max_width / w))))
                 rgb = cv2.resize(rgb, (max_width, new_h), interpolation=cv2.INTER_AREA)
             images.append(Image.fromarray(rgb))
-        return images
+        times = [round(float(i) / max(fps, 0.01), 3) for i in indexes[: len(images)]]
+        return images, times
     finally:
         cap.release()

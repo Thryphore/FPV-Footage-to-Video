@@ -33,8 +33,10 @@ DESCRIBE_PROMPT = (
     "Write editor notes. If DETECTED_PEOPLE is not none, PEOPLE must describe "
     "them (kids/spectators/playground/chasing when that fits) and MOVEMENT must "
     "mention them — never write 'no people'. "
-    "If DETECTED_ACTION mentions banking/rolls/flips, ACTION must include those "
-    "words — never replace them with only 'cruise'. "
+    "If DETECTED_ACTION mentions dive, power loop, flips, rolls, or banking, "
+    "ACTION must include those exact move names — never replace them with only "
+    "'cruise' or 'yaw'. MOVEMENT must describe those maneuvers in plain words "
+    "(e.g. steep dive toward the ground, power loop over the top, flip/roll). "
     "If DETECTED_PROPS or DETECTED_ACTION mentions under-object, under-bench, "
     "bench, table, shelter, or proximity, ACTION and MOVEMENT MUST explicitly say "
     "the under-bench / under-table / under-shelter proximity pass. "
@@ -45,7 +47,8 @@ DESCRIBE_PROMPT = (
     "PEOPLE: <none OR specific: kids chasing drone, people on playground, etc.>\n"
     "ACTION: <comma tags>\n"
     "MOVEMENT: <3-5 sentences naming trees/landmarks, people, under-object "
-    "proximity passes, maneuvers when present, camera path, pace, cut points>"
+    "proximity passes, dive/power-loop/flip maneuvers when present, camera path, "
+    "pace, cut points>"
 )
 
 
@@ -56,6 +59,11 @@ class ClipNotes:
     raw: str
     people: str = "none"
     action: str = ""
+    pace_tags: list[str] | None = None
+    move_events: list | None = None
+    coolest_window: dict | None = None
+    ends_in_crash: bool = False
+    crash_confidence: float = 0.0
     keyframe_seconds: float = 0.0
     inference_seconds: float = 0.0
     load_seconds: float = 0.0
@@ -103,12 +111,18 @@ def compose_search_blob(
     people: str,
     action: str,
     movement: str,
+    *,
+    pace_tags: list[str] | None = None,
+    ends_in_crash: bool = False,
 ) -> str:
     """Text used for semantic + keyword search."""
+    pace = ", ".join(pace_tags or [])
     parts = [
         (environment or "unknown").strip(),
         f"People: {(people or 'none').strip()}",
         f"Action: {(action or '').strip()}".rstrip(": ").strip(),
+        f"Pace: {pace}" if pace else "",
+        "ends in crash" if ends_in_crash else "",
         (movement or "").strip(),
     ]
     return " ".join(p for p in parts if p)
@@ -196,21 +210,28 @@ class VideoDescriber:
         self,
         video_path: Path,
         keyframe_count: int = DEFAULT_KEYFRAME_COUNT,
+        analysis: FlightAnalysis | None = None,
     ) -> ClipNotes:
         """
         YOLO + bank heuristics catch tiny people / rolls, then Qwen writes notes
         with those detections forced into the prompt.
         """
+        from .edit_signals import (
+            coolest_window,
+            ends_in_crash,
+            pace_tags,
+        )
         from .scene_signals import analyze_keyframes
 
         self.load()
         load_seconds = self.last_load_seconds
 
+        duration = float(analysis.duration_seconds) if analysis else 0.0
         t_key = time.perf_counter()
-        # Extra frames for YOLO/bank; fewer sent to the VL model for speed.
-        signal_images = extract_keyframes(
+        # Extra frames for YOLO / move detect; fewer sent to the VL model.
+        signal_images, signal_times = extract_keyframes(
             video_path,
-            count=max(keyframe_count * 2, 16),
+            count=max(keyframe_count * 3, 24),
             max_width=768,
         )
         keyframe_seconds = time.perf_counter() - t_key
@@ -227,7 +248,11 @@ class VideoDescriber:
 
         from .scene_signals import _looks_under_overhang, _pil_to_bgr
 
-        signals = analyze_keyframes(signal_images)
+        signals = analyze_keyframes(
+            signal_images,
+            times=signal_times,
+            duration_seconds=duration,
+        )
         step = max(1, len(signal_images) // keyframe_count)
         images = signal_images[::step][:keyframe_count]
         if len(images) < min(4, len(signal_images)):
@@ -291,11 +316,41 @@ class VideoDescriber:
             action = signals.action_hint
         elif signals.action_hint:
             # Merge missing aerobatic / proximity tags.
-            for tag in ("rolls", "flips", "banking", "under-object", "proximity"):
+            for tag in (
+                "power loop",
+                "dive",
+                "flips",
+                "rolls",
+                "banking",
+                "under-object",
+                "proximity",
+            ):
                 if tag in signals.action_hint.lower() and tag not in action.lower():
                     action = f"{action}, {tag}".strip(", ")
 
+        # Force named maneuvers into ACTION + MOVEMENT when detectors saw them.
+        move_tags = [t.lower() for t in (signals.move_tags or [])]
+        action_l_now = action.lower()
+        for tag in ("power loop", "dive", "flips", "rolls"):
+            if tag in move_tags and tag not in action_l_now:
+                action = f"{action}, {tag}".strip(", ")
+                action_l_now = action.lower()
+
         move_l = movement.lower()
+        maneuver_phrases = []
+        if "power loop" in move_tags and "power loop" not in move_l and "loop" not in move_l:
+            maneuver_phrases.append("a power loop")
+        if "dive" in move_tags and "dive" not in move_l:
+            maneuver_phrases.append("a steep dive")
+        if "flips" in move_tags and "flip" not in move_l:
+            maneuver_phrases.append("flips")
+        if "rolls" in move_tags and "roll" not in move_l:
+            maneuver_phrases.append("rolls")
+        if maneuver_phrases:
+            joined = ", ".join(maneuver_phrases)
+            movement = f"{movement.rstrip('. ')}. Includes {joined}."
+            move_l = movement.lower()
+
         negative_people = any(
             p in move_l
             for p in (
@@ -387,12 +442,49 @@ class VideoDescriber:
         if needs_cars and not said_cars:
             movement = f"{movement.rstrip('. ')}. Parked vehicles visible as landmarks."
 
+        # Coolest 10% + crash ending from the analyzer motion series.
+        cool = None
+        crash = False
+        crash_conf = 0.0
+        if analysis and analysis.motion_samples and analysis.motion_times:
+            cool = coolest_window(
+                analysis.motion_samples,
+                analysis.motion_times,
+                analysis.duration_seconds,
+                fraction=0.10,
+            )
+            crash, crash_conf = ends_in_crash(
+                analysis.motion_samples,
+                analysis.motion_times,
+                analysis.duration_seconds,
+            )
+        if crash:
+            if "ends in crash" not in action.lower():
+                action = f"{action}, ends in crash".strip(", ")
+            if "crash" not in movement.lower():
+                movement = f"{movement.rstrip('. ')}. Appears to end in a crash."
+
+        move_events = list(signals.move_events or [])
+        pace = pace_tags(
+            overall_speed=float(analysis.overall_speed_score) if analysis else 5.0,
+            top_speed=float(analysis.top_speed_score) if analysis else 5.0,
+            action=action,
+            people=people,
+            move_names=list(signals.move_tags or []),
+            ends_crash=crash,
+        )
+
         return ClipNotes(
             environment_tag=env or "unknown",
             people=people or "none",
             action=action or "unspecified",
             movement=movement,
             raw=raw,
+            pace_tags=pace,
+            move_events=move_events,
+            coolest_window=cool.to_dict() if cool else None,
+            ends_in_crash=crash,
+            crash_confidence=crash_conf,
             keyframe_seconds=keyframe_seconds,
             inference_seconds=inference_seconds,
             load_seconds=load_seconds,
@@ -408,11 +500,32 @@ def write_notes_file(
     people: str = "none",
     action: str = "",
     video_path: Path | None = None,
+    pace_tags: list[str] | None = None,
+    move_events: list | None = None,
+    coolest_window: dict | None = None,
+    ends_in_crash: bool = False,
+    crash_confidence: float = 0.0,
 ) -> Path:
     """Write human .txt + machine-readable .json sidecars for a keeper clip."""
     from .catalog import write_clip_json
+    from .edit_signals import MoveEvent
 
     video_name = Path(analysis.path).name
+    pace = [str(t) for t in (pace_tags or []) if str(t).strip()]
+    events: list[MoveEvent] = []
+    for item in move_events or []:
+        if isinstance(item, MoveEvent):
+            events.append(item)
+        elif isinstance(item, dict) and item.get("name"):
+            events.append(
+                MoveEvent(
+                    name=str(item["name"]),
+                    start_s=float(item.get("start_s") or 0.0),
+                    end_s=float(item.get("end_s") or 0.0),
+                    confidence=float(item.get("confidence") or 0.0),
+                )
+            )
+
     lines = [
         f"File: {video_name}",
         f"Duration: {analysis.duration_seconds:.1f}s",
@@ -421,11 +534,31 @@ def write_notes_file(
         f"Environment: {environment_tag.strip() or 'unknown'}",
         f"People: {(people or 'none').strip()}",
         f"Action: {(action or 'unspecified').strip()}",
-        "",
-        "Movement:",
-        movement.strip() or "(no description)",
-        "",
+        f"Pace: {', '.join(pace) if pace else 'unspecified'}",
+        (
+            f"Coolest 10%: {coolest_window['start_s']:.1f}-"
+            f"{coolest_window['end_s']:.1f}s"
+            if coolest_window
+            else "Coolest 10%: unknown"
+        ),
+        (
+            f"Ends in crash: yes ({crash_confidence:.2f})"
+            if ends_in_crash
+            else "Ends in crash: no"
+        ),
     ]
+    if events:
+        lines.append("Moves:")
+        for ev in events:
+            lines.append(f"  - {ev.label()}")
+    lines.extend(
+        [
+            "",
+            "Movement:",
+            movement.strip() or "(no description)",
+            "",
+        ]
+    )
     dest_txt.parent.mkdir(parents=True, exist_ok=True)
     dest_txt.write_text("\n".join(lines), encoding="utf-8")
 
@@ -441,6 +574,11 @@ def write_notes_file(
         movement=movement,
         people=people,
         action=action,
+        pace_tags=pace,
+        move_events=[e.to_dict() for e in events],
+        coolest_window=coolest_window,
+        ends_in_crash=ends_in_crash,
+        crash_confidence=crash_confidence,
     )
     return dest_txt
 

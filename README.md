@@ -18,7 +18,7 @@ cd C:\Users\awitt\fpv-clip-triage
 python -m fpv_triage
 ```
 
-1. Browse to your SD card / footage folder  
+1. Browse to your SD card / footage folder (each filled source reveals the next optional slot)  
 2. Choose an output folder on the PC (default: `Videos\fpv-keepers`)  
 3. Leave **AI descriptions** on to write a `.txt` notes file next to each keeper  
 4. Optional: uncheck **Copy videos to output** to write notes/search files only (videos stay on the SD card)  
@@ -47,12 +47,27 @@ Overall speed score: 6.4 / 10
 Top speed score: 8.1 / 10
 Environment: grassy park playground
 People: kids chasing the drone near playground
-Action: rolls, flips, slow cruise
+Action: rolls, flips, dive
+Pace: hype, people
+Coolest 10%: 22.0-26.8s
+Ends in crash: no
+Moves:
+  - flips @ 18.5-21.0s (0.72)
+  - dive @ 22.0-26.5s (0.91)
 
 Movement:
 Opens with a slow cruise over grass, then kids run after the drone. Mid-clip has a roll and flip
-over the playground, then a yaw turn back toward the spectators.
+over the playground, then a steep dive toward the field.
 ```
+
+## Video (text in the air)
+
+Use the **Video** tab after triage:
+
+1. Mode: **One selected clip** (AI edit is a placeholder for later)
+2. Pick a keeper from the output folder (or Browse)
+3. **Render video** — cut starts after **5s of proven flight**, then flies through the phrase `This is text right here` **15 times** as a 3D sign in the air (one phrase per pass)
+4. MP4s land in `<output>/renders/`
 
 ## AI search
 
@@ -61,9 +76,9 @@ After triage with descriptions on, the output folder gets:
 - `*.txt` human notes  
 - `*.json` per-clip machine notes  
 - `clips_catalog.json` all keepers in one file  
-- `clips_search_index.npz` local semantic index  
+- `clips_search_index.npz` local semantic index (`Qwen3-Embedding-0.6B`)  
 
-Use the **AI Search** tab, or:
+Rebuild the index after upgrading the embedder, or when notes change. Use the **AI Search** tab, or:
 
 ```powershell
 python -m fpv_triage --cli --output C:\Users\awitt\Videos\fpv-keepers --rebuild-index
@@ -74,6 +89,7 @@ python -m fpv_triage --cli --output C:\Users\awitt\Videos\fpv-keepers --search "
 
 ```powershell
 python -m fpv_triage --cli --source E:\DCIM --output C:\Users\awitt\Videos\fpv-keepers
+python -m fpv_triage --cli --source E:\DCIM --source F:\DCIM --output C:\Users\awitt\Videos\fpv-keepers
 python -m fpv_triage --cli --source E:\DCIM --output C:\Users\awitt\Videos\fpv-keepers --no-copy-videos
 ```
 

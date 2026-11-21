@@ -10,11 +10,28 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from .analyzer import AnalyzerConfig, FlightAnalysis
+from .app_icon import apply_window_icon, set_windows_app_id
 from .catalog import NotesSearchIndex, rebuild_search_assets
 from .describer import format_timing_line
 from .pipeline import run_triage
-from .scanner import delete_lrf_files, find_lrf_files
+from .prefs import load_prefs, save_prefs
+from .scanner import (
+    delete_lrf_files,
+    delete_srt_files,
+    find_lrf_files,
+    find_srt_files,
+)
+from .video_render import (
+    PLACEHOLDER_REPEAT,
+    PLACEHOLDER_TEXT,
+    list_keeper_videos,
+    placeholder_block,
+    render_single_clip,
+)
 
+
+# Must run before the first Tk window is created (Windows taskbar grouping).
+set_windows_app_id()
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -26,25 +43,58 @@ class FpvTriageApp(ctk.CTk):
         self.title("FPV Footage to Video")
         self.geometry("960x760")
         self.minsize(820, 640)
+        apply_window_icon(self)
 
         self._worker: threading.Thread | None = None
         self._cancel = threading.Event()
         self._search_index = NotesSearchIndex()
 
-        self.source_var = ctk.StringVar()
+        self._source_vars: list[ctk.StringVar] = []
+        self._source_labels: list[ctk.CTkLabel] = []
+        self._syncing_sources = False
+        self._prefs = load_prefs()
+        saved_output = str(self._prefs.get("output") or "").strip()
         self.output_var = ctk.StringVar(
-            value=str(Path.home() / "Videos" / "fpv-keepers")
+            value=saved_output or str(Path.home() / "Videos" / "fpv-keepers")
         )
-        self.threshold_var = ctk.StringVar(value="6.0")
-        self.copy_videos_var = ctk.BooleanVar(value=True)
-        self.describe_var = ctk.BooleanVar(value=True)
-        self.status_var = ctk.StringVar(value="Pick a source folder, then hit Start.")
+        self.threshold_var = ctk.StringVar(
+            value=str(self._prefs.get("threshold") or "6.0")
+        )
+        self.copy_videos_var = ctk.BooleanVar(
+            value=bool(self._prefs.get("copy_videos", True))
+        )
+        self.describe_var = ctk.BooleanVar(
+            value=bool(self._prefs.get("describe", True))
+        )
+        self.status_var = ctk.StringVar(
+            value="Pick a source folder, then hit Start. More slots appear as you add paths."
+        )
         self.search_query_var = ctk.StringVar()
         self.search_status_var = ctk.StringVar(
             value="Search keeper notes with AI (e.g. slow cruise near trees)."
         )
 
+        self._render_worker: threading.Thread | None = None
+        self._render_cancel = threading.Event()
+        self.video_mode_var = ctk.StringVar(value="single")
+        saved_clip = str(self._prefs.get("render_clip") or "").strip()
+        self.video_clip_var = ctk.StringVar(value=saved_clip)
+        self.video_status_var = ctk.StringVar(
+            value="Pick a keeper clip, then Render. Starts after 5s of flight."
+        )
+        self.video_text_preview = placeholder_block(
+            PLACEHOLDER_TEXT, PLACEHOLDER_REPEAT
+        )
+
         self._build()
+        self._restore_sources(self._prefs.get("sources"))
+        self.output_var.trace_add(
+            "write", lambda *_args: self.after_idle(self._save_ui_prefs)
+        )
+        self.video_clip_var.trace_add(
+            "write", lambda *_args: self.after_idle(self._save_ui_prefs)
+        )
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
         pad = {"padx": 16, "pady": 8}
@@ -60,7 +110,7 @@ class FpvTriageApp(ctk.CTk):
 
         subtitle = ctk.CTkLabel(
             self,
-            text="Triage SD-card flights, score speed, write movement notes, then AI-search keepers.",
+            text="Triage SD-card flights, AI-search keepers, then render a clip with text in the air.",
             text_color=("gray30", "gray70"),
         )
         subtitle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
@@ -69,8 +119,10 @@ class FpvTriageApp(ctk.CTk):
         self.tabs.grid(row=2, column=0, sticky="nsew", **pad)
         triage = self.tabs.add("Triage")
         search = self.tabs.add("AI Search")
+        video = self.tabs.add("Video")
         self._build_triage_tab(triage)
         self._build_search_tab(search)
+        self._build_video_tab(video)
 
     def _build_triage_tab(self, tab: ctk.CTkFrame) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -80,11 +132,15 @@ class FpvTriageApp(ctk.CTk):
         form.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         form.grid_columnconfigure(1, weight=1)
 
-        self._path_row(form, 0, "Source (SD / folder)", self.source_var, self._browse_source)
+        self._sources_host = ctk.CTkFrame(form, fg_color="transparent")
+        self._sources_host.grid(row=0, column=0, columnspan=4, sticky="ew")
+        self._sources_host.grid_columnconfigure(1, weight=1)
+        self._sync_source_rows()
+
         self._path_row(form, 1, "Output folder", self.output_var, self._browse_output)
 
         opts = ctk.CTkFrame(form, fg_color="transparent")
-        opts.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        opts.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 4))
         opts.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -115,7 +171,7 @@ class FpvTriageApp(ctk.CTk):
         ).pack(anchor="w", pady=(8, 0))
 
         buttons = ctk.CTkFrame(form, fg_color="transparent")
-        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        buttons.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(12, 4))
 
         self.start_btn = ctk.CTkButton(
             buttons, text="Start triage", width=140, command=self._start
@@ -149,7 +205,17 @@ class FpvTriageApp(ctk.CTk):
             hover_color=("#822", "#511"),
             command=self._delete_lrf_files,
         )
-        self.lrf_btn.pack(side="left")
+        self.lrf_btn.pack(side="left", padx=(0, 8))
+
+        self.srt_btn = ctk.CTkButton(
+            buttons,
+            text="Delete .SRT files",
+            width=140,
+            fg_color=("#a33", "#722"),
+            hover_color=("#822", "#511"),
+            command=self._delete_srt_files,
+        )
+        self.srt_btn.pack(side="left")
 
         body = ctk.CTkFrame(tab)
         body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -212,6 +278,130 @@ class FpvTriageApp(ctk.CTk):
         )
         self.search_log.configure(state="disabled")
 
+    def _build_video_tab(self, tab: ctk.CTkFrame) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        form = ctk.CTkFrame(tab)
+        form.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Mode").grid(
+            row=0, column=0, sticky="w", padx=(12, 8), pady=(10, 4)
+        )
+        modes = ctk.CTkFrame(form, fg_color="transparent")
+        modes.grid(row=0, column=1, columnspan=3, sticky="w", pady=(10, 4))
+        ctk.CTkRadioButton(
+            modes,
+            text="One selected clip",
+            variable=self.video_mode_var,
+            value="single",
+        ).pack(side="left", padx=(0, 16))
+        self.video_ai_radio = ctk.CTkRadioButton(
+            modes,
+            text="AI edit (coming soon)",
+            variable=self.video_mode_var,
+            value="ai",
+            state="disabled",
+        )
+        self.video_ai_radio.pack(side="left")
+
+        ctk.CTkLabel(form, text="Clip").grid(
+            row=1, column=0, sticky="w", padx=(12, 8), pady=6
+        )
+        ctk.CTkEntry(form, textvariable=self.video_clip_var).grid(
+            row=1, column=1, sticky="ew", pady=6
+        )
+        ctk.CTkButton(
+            form, text="Browse", width=90, command=self._browse_video_clip
+        ).grid(row=1, column=2, padx=(8, 4), pady=6)
+        ctk.CTkButton(
+            form,
+            text="Refresh list",
+            width=110,
+            fg_color=("gray70", "gray30"),
+            command=self._refresh_video_clip_list,
+        ).grid(row=1, column=3, padx=(4, 12), pady=6)
+
+        ctk.CTkLabel(form, text="Keepers").grid(
+            row=2, column=0, sticky="nw", padx=(12, 8), pady=6
+        )
+        self.video_clip_menu = ctk.CTkOptionMenu(
+            form,
+            values=["(refresh to list keepers)"],
+            command=self._on_video_clip_picked,
+        )
+        self.video_clip_menu.grid(
+            row=2, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6
+        )
+        self.video_clip_menu.set("(refresh to list keepers)")
+
+        ctk.CTkLabel(form, text="Text (placeholder)").grid(
+            row=3, column=0, sticky="nw", padx=(12, 8), pady=6
+        )
+        self.video_text_box = ctk.CTkTextbox(
+            form, height=110, font=ctk.CTkFont(family="Consolas", size=12)
+        )
+        self.video_text_box.grid(
+            row=3, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6
+        )
+        self.video_text_box.insert("1.0", self.video_text_preview)
+        self.video_text_box.configure(state="disabled")
+
+        buttons = ctk.CTkFrame(form, fg_color="transparent")
+        buttons.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 8))
+
+        self.video_render_btn = ctk.CTkButton(
+            buttons, text="Render video", width=140, command=self._start_render
+        )
+        self.video_render_btn.pack(side="left", padx=(12, 8))
+
+        self.video_cancel_btn = ctk.CTkButton(
+            buttons,
+            text="Cancel",
+            width=100,
+            fg_color=("gray65", "gray35"),
+            state="disabled",
+            command=self._request_render_cancel,
+        )
+        self.video_cancel_btn.pack(side="left", padx=(0, 8))
+
+        self.video_open_btn = ctk.CTkButton(
+            buttons,
+            text="Open renders",
+            width=120,
+            fg_color=("gray70", "gray30"),
+            command=self._open_renders,
+        )
+        self.video_open_btn.pack(side="left")
+
+        body = ctk.CTkFrame(tab)
+        body.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        body.grid_columnconfigure(0, weight=1)
+
+        self.video_progress = ctk.CTkProgressBar(body)
+        self.video_progress.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
+        self.video_progress.set(0)
+
+        ctk.CTkLabel(body, textvariable=self.video_status_var, anchor="w").grid(
+            row=1, column=0, sticky="ew", padx=12, pady=(0, 8)
+        )
+
+        self.video_log = ctk.CTkTextbox(
+            tab, font=ctk.CTkFont(family="Consolas", size=13)
+        )
+        self.video_log.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.video_log.insert(
+            "end",
+            "Renders one selected clip from the Triage output folder.\n"
+            "Cut starts after 5s of proven flight.\n"
+            "Each pass flies through \"This is text right here\" as a perspective "
+            "sign (15 times), with parallax from the footage.\n"
+            "AI edit mode is reserved for later multi-clip assembly.\n",
+        )
+        self.video_log.configure(state="disabled")
+        self.after_idle(self._refresh_video_clip_list)
+
     def _path_row(
         self,
         parent: ctk.CTkFrame,
@@ -226,18 +416,171 @@ class FpvTriageApp(ctk.CTk):
         entry = ctk.CTkEntry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", pady=6)
         ctk.CTkButton(parent, text="Browse", width=90, command=browse_cmd).grid(
-            row=row, column=2, padx=(8, 12), pady=6
+            row=row, column=2, padx=(8, 4), pady=6
         )
 
-    def _browse_source(self) -> None:
-        path = filedialog.askdirectory(title="Select SD card or footage folder")
-        if path:
-            self.source_var.set(path)
+    def _source_label(self, index: int, total: int) -> str:
+        if total == 1:
+            return "Source (SD / folder)"
+        return f"Source {index + 1}"
+
+    def _add_source_row(self, index: int, value: str = "") -> None:
+        var = ctk.StringVar(value=value)
+        var.trace_add("write", lambda *_args: self.after_idle(self._sync_source_rows))
+        self._source_vars.append(var)
+
+        label = ctk.CTkLabel(self._sources_host, text="")
+        label.grid(row=index, column=0, sticky="w", padx=(12, 8), pady=6)
+        self._source_labels.append(label)
+
+        ctk.CTkEntry(self._sources_host, textvariable=var).grid(
+            row=index, column=1, sticky="ew", pady=6
+        )
+        ctk.CTkButton(
+            self._sources_host,
+            text="Browse",
+            width=90,
+            command=lambda i=index: self._browse_source_at(i),
+        ).grid(row=index, column=2, padx=(8, 4), pady=6)
+        ctk.CTkButton(
+            self._sources_host,
+            text="Clear",
+            width=70,
+            fg_color=("gray70", "gray30"),
+            command=lambda i=index: self._clear_source_at(i),
+        ).grid(row=index, column=3, padx=(4, 12), pady=6)
+
+    def _remove_trailing_source_row(self) -> None:
+        if len(self._source_vars) <= 1:
+            return
+        index = len(self._source_vars) - 1
+        for child in self._sources_host.grid_slaves(row=index):
+            child.destroy()
+        self._source_vars.pop()
+        if self._source_labels:
+            self._source_labels.pop()
+
+    def _rebuild_source_rows(self, values: list[str]) -> None:
+        for child in self._sources_host.winfo_children():
+            child.destroy()
+        self._source_vars = []
+        self._source_labels = []
+        filled = [v.strip() for v in values if str(v).strip()]
+        for index, value in enumerate(filled + [""]):
+            self._add_source_row(index, value)
+        self._relabel_source_rows()
+
+    def _restore_sources(self, raw) -> None:
+        values: list[str] = []
+        if isinstance(raw, list):
+            values = [str(item).strip() for item in raw if str(item).strip()]
+        elif isinstance(raw, str) and raw.strip():
+            values = [raw.strip()]
+        if not values:
+            return
+        self._syncing_sources = True
+        try:
+            self._rebuild_source_rows(values)
+        finally:
+            self._syncing_sources = False
+
+    def _relabel_source_rows(self) -> None:
+        total = len(self._source_vars)
+        for index, label in enumerate(self._source_labels):
+            label.configure(text=self._source_label(index, total))
+
+    def _sync_source_rows(self) -> None:
+        """Keep filled sources, then exactly one empty optional slot for the next folder."""
+        if self._syncing_sources:
+            return
+        self._syncing_sources = True
+        try:
+            if not self._source_vars:
+                self._add_source_row(0, "")
+                self._relabel_source_rows()
+                return
+
+            # Compact holes (empty between filled) without killing focus on normal typing.
+            stripped = [v.get().strip() for v in self._source_vars]
+            filled_values = [v.get().strip() for v in self._source_vars if v.get().strip()]
+            has_hole = any(
+                not stripped[i] and any(stripped[i + 1 :])
+                for i in range(len(stripped) - 1)
+            )
+            if has_hole:
+                self._rebuild_source_rows(filled_values)
+                return
+
+            # Last row filled → offer another optional source.
+            if self._source_vars[-1].get().strip():
+                self._add_source_row(len(self._source_vars), "")
+
+            # Only one trailing empty slot.
+            while (
+                len(self._source_vars) > 1
+                and not self._source_vars[-1].get().strip()
+                and not self._source_vars[-2].get().strip()
+            ):
+                self._remove_trailing_source_row()
+
+            self._relabel_source_rows()
+        finally:
+            self._syncing_sources = False
+            self.after_idle(self._save_ui_prefs)
+
+    def _browse_source_at(self, index: int) -> None:
+        title = (
+            "Select SD card or footage folder"
+            if index == 0
+            else f"Select source folder {index + 1}"
+        )
+        path = filedialog.askdirectory(title=title)
+        if path and 0 <= index < len(self._source_vars):
+            self._source_vars[index].set(path)
+
+    def _clear_source_at(self, index: int) -> None:
+        if 0 <= index < len(self._source_vars):
+            self._source_vars[index].set("")
 
     def _browse_output(self) -> None:
         path = filedialog.askdirectory(title="Select output folder on this PC")
         if path:
             self.output_var.set(path)
+
+    def _selected_sources(self) -> list[Path]:
+        sources: list[Path] = []
+        seen: set[str] = set()
+        for var in self._source_vars:
+            text = var.get().strip()
+            if not text:
+                continue
+            path = Path(text)
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(path)
+        return sources
+
+    def _save_ui_prefs(self) -> None:
+        save_prefs(
+            {
+                "sources": [
+                    var.get().strip()
+                    for var in self._source_vars
+                    if var.get().strip()
+                ],
+                "output": self.output_var.get().strip(),
+                "threshold": self.threshold_var.get().strip(),
+                "copy_videos": bool(self.copy_videos_var.get()),
+                "describe": bool(self.describe_var.get()),
+                "render_clip": self.video_clip_var.get().strip(),
+            }
+        )
+
+    def _on_close(self) -> None:
+        self._save_ui_prefs()
+        self.destroy()
 
     def _open_output(self) -> None:
         output = Path(self.output_var.get().strip())
@@ -267,24 +610,37 @@ class FpvTriageApp(ctk.CTk):
         self.start_btn.configure(state="disabled" if running else "normal")
         self.cancel_btn.configure(state="normal" if running else "disabled")
         self.lrf_btn.configure(state="disabled" if running else "normal")
+        self.srt_btn.configure(state="disabled" if running else "normal")
 
-    def _delete_lrf_files(self) -> None:
-        source = Path(self.source_var.get().strip())
-        if not source.exists() or not source.is_dir():
+    def _delete_sidecar_files(
+        self,
+        *,
+        kind: str,
+        find_fn,
+        delete_fn,
+        button: ctk.CTkButton,
+        confirm_detail: str,
+    ) -> None:
+        title = f"Delete .{kind} files"
+        sources = self._selected_sources()
+        valid = [p for p in sources if p.exists() and p.is_dir()]
+        if not valid:
             messagebox.showerror(
-                "Delete .LRF",
-                "Choose a valid Source folder/drive first (SD card or footage folder).",
+                title,
+                "Choose at least one valid Source folder/drive first "
+                "(SD card or footage folder).",
             )
             return
 
         try:
-            files = find_lrf_files(source)
+            files = find_fn(valid)
         except OSError as exc:
-            messagebox.showerror("Delete .LRF", str(exc))
+            messagebox.showerror(title, str(exc))
             return
 
         if not files:
-            messagebox.showinfo("Delete .LRF", f"No .LRF files found under:\n{source}")
+            listed = "\n".join(str(p) for p in valid)
+            messagebox.showinfo(title, f"No .{kind} files found under:\n{listed}")
             return
 
         total_bytes = 0
@@ -294,33 +650,70 @@ class FpvTriageApp(ctk.CTk):
             except OSError:
                 pass
         size_mb = total_bytes / (1024 * 1024)
+        listed = "\n".join(str(p) for p in valid)
         ok = messagebox.askyesno(
-            "Delete .LRF",
-            f"Delete {len(files)} DJI .LRF file(s) (~{size_mb:.1f} MB) under:\n"
-            f"{source}\n\n"
-            "These are low-res proxy files. Videos (.MP4) are not touched.",
+            title,
+            f"Delete {len(files)} .{kind} file(s) (~{size_mb:.1f} MB) under:\n"
+            f"{listed}\n\n"
+            f"{confirm_detail}",
         )
         if not ok:
             return
 
+        button.configure(state="disabled")
         self.lrf_btn.configure(state="disabled")
-        self.status_var.set(f"Deleting {len(files)} .LRF file(s)…")
+        self.srt_btn.configure(state="disabled")
+        self.status_var.set(f"Deleting {len(files)} .{kind} file(s)…")
 
         def worker() -> None:
             try:
-                deleted, failed = delete_lrf_files(source)
-                self.after(0, lambda: self._on_lrf_deleted(deleted, failed))
+                deleted, failed = delete_fn(valid)
+                self.after(
+                    0,
+                    lambda: self._on_sidecar_deleted(
+                        kind, deleted, failed, button
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._on_lrf_error(exc))
+                self.after(0, lambda: self._on_sidecar_error(kind, exc, button))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_lrf_deleted(
-        self, deleted: list[Path], failed: list[tuple[Path, str]]
+    def _delete_lrf_files(self) -> None:
+        self._delete_sidecar_files(
+            kind="LRF",
+            find_fn=find_lrf_files,
+            delete_fn=delete_lrf_files,
+            button=self.lrf_btn,
+            confirm_detail=(
+                "These are low-res proxy files. Videos (.MP4/.MOV) are not touched."
+            ),
+        )
+
+    def _delete_srt_files(self) -> None:
+        self._delete_sidecar_files(
+            kind="SRT",
+            find_fn=find_srt_files,
+            delete_fn=delete_srt_files,
+            button=self.srt_btn,
+            confirm_detail=(
+                "These are goggles subtitle/OSD logs (no useful flight telemetry "
+                "in your FPV SRTs). Videos (.MP4/.MOV) are not touched."
+            ),
+        )
+
+    def _on_sidecar_deleted(
+        self,
+        kind: str,
+        deleted: list[Path],
+        failed: list[tuple[Path, str]],
+        button: ctk.CTkButton,
     ) -> None:
         self.lrf_btn.configure(state="normal")
+        self.srt_btn.configure(state="normal")
+        button.configure(state="normal")
         self._append_log("")
-        self._append_log(f"Deleted {len(deleted)} .LRF file(s).")
+        self._append_log(f"Deleted {len(deleted)} .{kind} file(s).")
         for path in deleted[:20]:
             self._append_log(f"  - {path}")
         if len(deleted) > 20:
@@ -328,37 +721,52 @@ class FpvTriageApp(ctk.CTk):
         for path, err in failed:
             self._append_log(f"  FAILED {path}: {err}")
 
+        title = f"Delete .{kind}"
         if failed:
             self.status_var.set(
-                f"Deleted {len(deleted)} .LRF file(s); {len(failed)} failed."
+                f"Deleted {len(deleted)} .{kind} file(s); {len(failed)} failed."
             )
             messagebox.showwarning(
-                "Delete .LRF",
+                title,
                 f"Deleted {len(deleted)} file(s).\n"
                 f"{len(failed)} could not be removed (see log).",
             )
         else:
-            self.status_var.set(f"Deleted {len(deleted)} .LRF file(s).")
+            self.status_var.set(f"Deleted {len(deleted)} .{kind} file(s).")
             messagebox.showinfo(
-                "Delete .LRF",
-                f"Removed {len(deleted)} .LRF file(s) from the source folder.",
+                title,
+                f"Removed {len(deleted)} .{kind} file(s) from the source folder.",
             )
 
-    def _on_lrf_error(self, exc: Exception) -> None:
+    def _on_sidecar_error(
+        self, kind: str, exc: Exception, button: ctk.CTkButton
+    ) -> None:
         self.lrf_btn.configure(state="normal")
-        self.status_var.set("Delete .LRF failed.")
-        messagebox.showerror("Delete .LRF", str(exc))
+        self.srt_btn.configure(state="normal")
+        button.configure(state="normal")
+        self.status_var.set(f"Delete .{kind} failed.")
+        messagebox.showerror(f"Delete .{kind}", str(exc))
 
     def _request_cancel(self) -> None:
         self._cancel.set()
         self.status_var.set("Cancel requested… finishing current clip.")
 
     def _start(self) -> None:
-        source = Path(self.source_var.get().strip())
+        sources = self._selected_sources()
         output = Path(self.output_var.get().strip())
 
-        if not source.exists():
-            messagebox.showerror("Source", "Choose a valid source folder or drive.")
+        if not sources:
+            messagebox.showerror(
+                "Source", "Choose at least one source folder or drive."
+            )
+            return
+        missing = [p for p in sources if not p.exists()]
+        if missing:
+            messagebox.showerror(
+                "Source",
+                "These source paths do not exist:\n"
+                + "\n".join(str(p) for p in missing),
+            )
             return
         if not self.output_var.get().strip():
             messagebox.showerror("Output", "Choose an output folder on this PC.")
@@ -381,7 +789,9 @@ class FpvTriageApp(ctk.CTk):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        self._append_log(f"Source: {source}")
+        for i, source in enumerate(sources, start=1):
+            label = "Source" if len(sources) == 1 else f"Source {i}"
+            self._append_log(f"{label}: {source}")
         self._append_log(f"Output: {output}")
         copy_videos = bool(self.copy_videos_var.get())
         self._append_log(
@@ -404,7 +814,7 @@ class FpvTriageApp(ctk.CTk):
                         ),
                     )
                 summary = run_triage(
-                    source,
+                    sources,
                     output,
                     config,
                     copy_videos=copy_videos,
@@ -600,6 +1010,162 @@ class FpvTriageApp(ctk.CTk):
     def _on_search_error(self, exc: Exception) -> None:
         self.search_status_var.set("Search failed.")
         messagebox.showerror("Search failed", str(exc))
+
+    def _renders_dir(self) -> Path:
+        return Path(self.output_var.get().strip() or ".") / "renders"
+
+    def _append_video_log(self, line: str) -> None:
+        self.video_log.configure(state="normal")
+        self.video_log.insert("end", line + "\n")
+        self.video_log.see("end")
+        self.video_log.configure(state="disabled")
+
+    def _browse_video_clip(self) -> None:
+        initial = Path(self.output_var.get().strip() or ".")
+        if not initial.is_dir():
+            initial = Path.home()
+        path = filedialog.askopenfilename(
+            title="Select FPV clip to render",
+            initialdir=str(initial),
+            filetypes=[
+                ("Video", "*.mp4 *.mov *.MP4 *.MOV *.mkv *.avi"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self.video_clip_var.set(path)
+
+    def _refresh_video_clip_list(self) -> None:
+        output = Path(self.output_var.get().strip())
+        clips = list_keeper_videos(output) if output.is_dir() else []
+        if not clips:
+            self.video_clip_menu.configure(values=["(no videos in output folder)"])
+            self.video_clip_menu.set("(no videos in output folder)")
+            return
+        names = [p.name for p in clips]
+        self._video_clip_by_name = {p.name: p for p in clips}
+        self.video_clip_menu.configure(values=names)
+        current = Path(self.video_clip_var.get().strip()).name
+        if current in self._video_clip_by_name:
+            self.video_clip_menu.set(current)
+        else:
+            self.video_clip_menu.set(names[0])
+            self.video_clip_var.set(str(self._video_clip_by_name[names[0]]))
+
+    def _on_video_clip_picked(self, name: str) -> None:
+        mapping = getattr(self, "_video_clip_by_name", {})
+        path = mapping.get(name)
+        if path is not None:
+            self.video_clip_var.set(str(path))
+
+    def _open_renders(self) -> None:
+        renders = self._renders_dir()
+        renders.mkdir(parents=True, exist_ok=True)
+        try:
+            import os
+
+            os.startfile(renders)  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror("Renders", str(exc))
+
+    def _set_render_running(self, running: bool) -> None:
+        self.video_render_btn.configure(state="disabled" if running else "normal")
+        self.video_cancel_btn.configure(state="normal" if running else "disabled")
+
+    def _request_render_cancel(self) -> None:
+        self._render_cancel.set()
+        self.video_status_var.set("Cancel requested…")
+
+    def _start_render(self) -> None:
+        if self.video_mode_var.get() != "single":
+            messagebox.showinfo("Video", "AI edit is not available yet.")
+            return
+
+        clip = Path(self.video_clip_var.get().strip())
+        if not clip.is_file():
+            messagebox.showerror(
+                "Video",
+                "Choose a video file (Browse or pick from the keepers list).",
+            )
+            return
+
+        try:
+            threshold = float(self.threshold_var.get())
+        except ValueError:
+            threshold = 6.0
+
+        if not self.output_var.get().strip():
+            messagebox.showerror("Video", "Set an Output folder on the Triage tab.")
+            return
+        renders = self._renders_dir()
+        config = AnalyzerConfig(motion_threshold=max(0.0, threshold))
+
+        self._render_cancel.clear()
+        self._set_render_running(True)
+        self.video_progress.set(0)
+        self.video_status_var.set("Starting render…")
+        self.video_log.configure(state="normal")
+        self.video_log.delete("1.0", "end")
+        self.video_log.configure(state="disabled")
+        self._append_video_log(f"Clip: {clip}")
+        self._append_video_log(f"Output: {renders}")
+        self._append_video_log(
+            f"Text: \"{PLACEHOLDER_TEXT}\" — {PLACEHOLDER_REPEAT} perspective "
+            f"fly-throughs + scene parallax"
+        )
+        self._append_video_log("")
+
+        def worker() -> None:
+            try:
+                result = render_single_clip(
+                    clip,
+                    renders,
+                    text=PLACEHOLDER_TEXT,
+                    text_repeat=PLACEHOLDER_REPEAT,
+                    config=config,
+                    should_cancel=self._render_cancel.is_set,
+                    on_progress=lambda frac, msg: self.after(
+                        0,
+                        lambda frac=frac, msg=msg: self._on_render_progress(frac, msg),
+                    ),
+                )
+                self.after(0, lambda: self._on_render_done(result))
+            except Exception as exc:  # noqa: BLE001
+                tb = traceback.format_exc()
+                self.after(0, lambda: self._on_render_error(exc, tb))
+
+        self._render_worker = threading.Thread(target=worker, daemon=True)
+        self._render_worker.start()
+
+    def _on_render_progress(self, frac: float, message: str) -> None:
+        self.video_progress.set(max(0.0, min(1.0, float(frac))))
+        self.video_status_var.set(message)
+
+    def _on_render_done(self, result) -> None:
+        self._set_render_running(False)
+        self.video_progress.set(1.0 if result.frame_count else 0.0)
+        if result.cancelled:
+            self.video_status_var.set("Render cancelled.")
+            self._append_video_log("Cancelled.")
+            return
+        self.video_status_var.set(f"Done — {result.output_path}")
+        self._append_video_log(
+            f"Flight start: {result.start_s:.1f}s  |  "
+            f"rendered {result.duration_s:.1f}s ({result.frame_count} frames)"
+        )
+        self._append_video_log(f"Wrote: {result.output_path}")
+        messagebox.showinfo(
+            "Render complete",
+            f"Started at {result.start_s:.1f}s of flight proof.\n\n"
+            f"Saved:\n{result.output_path}",
+        )
+
+    def _on_render_error(self, exc: Exception, tb: str) -> None:
+        self._set_render_running(False)
+        self.video_status_var.set("Render failed.")
+        self._append_video_log(f"ERROR: {exc}")
+        self._append_video_log(tb)
+        messagebox.showerror("Render failed", str(exc))
 
 
 def main() -> None:

@@ -13,9 +13,14 @@ import numpy as np
 
 CATALOG_NAME = "clips_catalog.json"
 INDEX_NAME = "clips_search_index.npz"
-EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-# Cosine floor for MiniLM; below this, results are usually unrelated nearest-neighbors.
+EMBED_MODEL_ID = "Qwen/Qwen3-Embedding-0.6B"
+# Cosine floor for Qwen3-Embedding; below this, results are usually unrelated nearest-neighbors.
 DEFAULT_MIN_SCORE = 0.32
+# Task instruction used with Qwen3's query prompt template.
+QUERY_PROMPT = (
+    "Instruct: Given a search query for FPV drone flight clip notes, "
+    "retrieve relevant clips\nQuery:"
+)
 
 
 @dataclass
@@ -32,6 +37,11 @@ class ClipRecord:
     search_text: str
     people: str = "none"
     action: str = ""
+    pace_tags: list[str] | None = None
+    move_events: list[dict] | None = None
+    coolest_window: dict | None = None
+    ends_in_crash: bool = False
+    crash_confidence: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -111,6 +121,11 @@ def write_clip_json(
     movement: str,
     people: str = "none",
     action: str = "",
+    pace_tags: list[str] | None = None,
+    move_events: list[dict] | None = None,
+    coolest_window: dict | None = None,
+    ends_in_crash: bool = False,
+    crash_confidence: float = 0.0,
 ) -> Path:
     """Machine-readable sidecar for AI search / agents."""
     from .describer import compose_search_blob
@@ -119,6 +134,7 @@ def write_clip_json(
     action = (action or "").strip()
     environment = (environment or "unknown").strip()
     movement = (movement or "").strip()
+    pace = [str(t) for t in (pace_tags or []) if str(t).strip()]
     record = ClipRecord(
         file=video_path.name,
         video_path=str(video_path),
@@ -131,7 +147,19 @@ def write_clip_json(
         people=people,
         action=action,
         movement=movement,
-        search_text=compose_search_blob(environment, people, action, movement),
+        pace_tags=pace,
+        move_events=list(move_events or []),
+        coolest_window=coolest_window,
+        ends_in_crash=bool(ends_in_crash),
+        crash_confidence=float(crash_confidence or 0.0),
+        search_text=compose_search_blob(
+            environment,
+            people,
+            action,
+            movement,
+            pace_tags=pace,
+            ends_in_crash=bool(ends_in_crash),
+        ),
     )
     dest_json.parent.mkdir(parents=True, exist_ok=True)
     dest_json.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
@@ -162,10 +190,24 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
         people = data.get("people") or "none"
         action = data.get("action") or ""
         movement = data.get("movement") or data.get("description") or ""
+        pace_tags = data.get("pace_tags") or []
+        if not isinstance(pace_tags, list):
+            pace_tags = []
+        move_events = data.get("move_events") or []
+        if not isinstance(move_events, list):
+            move_events = []
+        coolest_window = data.get("coolest_window")
+        ends_in_crash = bool(data.get("ends_in_crash") or False)
+        crash_confidence = float(data.get("crash_confidence") or 0.0)
         from .describer import compose_search_blob
 
         search_text = data.get("search_text") or compose_search_blob(
-            env, people, action, movement
+            env,
+            people,
+            action,
+            movement,
+            pace_tags=pace_tags,
+            ends_in_crash=ends_in_crash,
         )
         key = str(video_path.resolve()) if video_path.exists() else json_path.stem
         if key in seen:
@@ -184,6 +226,11 @@ def collect_records(output_dir: Path) -> list[ClipRecord]:
                 people=people,
                 action=action,
                 movement=movement,
+                pace_tags=pace_tags,
+                move_events=move_events,
+                coolest_window=coolest_window if isinstance(coolest_window, dict) else None,
+                ends_in_crash=ends_in_crash,
+                crash_confidence=crash_confidence,
                 search_text=search_text,
             )
         )
@@ -247,7 +294,7 @@ def write_catalog(output_dir: Path, records: list[ClipRecord] | None = None) -> 
 
 
 class NotesSearchIndex:
-    """Local embedding search over keeper notes (CPU MiniLM)."""
+    """Local embedding search over keeper notes (Qwen3-Embedding)."""
 
     def __init__(self, model_id: str = EMBED_MODEL_ID) -> None:
         self.model_id = model_id
@@ -275,6 +322,7 @@ class NotesSearchIndex:
         self._ensure_model()
         texts = [r.search_text for r in self.records]
         assert self._model is not None
+        # Documents: no instruction prompt (Qwen3 retrieval convention).
         emb = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         self.embeddings = np.asarray(emb, dtype=np.float32)
         self.save(Path(output_dir) / INDEX_NAME)
@@ -334,7 +382,13 @@ class NotesSearchIndex:
 
         self._ensure_model()
         assert self._model is not None
-        q = self._model.encode([query], normalize_embeddings=True, show_progress_bar=False)
+        # Queries: use Qwen3 instruction template for better retrieval.
+        q = self._model.encode(
+            [query],
+            prompt=QUERY_PROMPT,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
         q = np.asarray(q, dtype=np.float32)[0]
         semantic = self.embeddings @ q
         keyword = np.asarray(

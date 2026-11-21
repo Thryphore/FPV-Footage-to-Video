@@ -39,6 +39,8 @@ class SceneSignals:
     close_prop_frames: int = 0
     tree_frames: int = 0
     max_foliage_score: float = 0.0
+    move_tags: list[str] | None = None
+    move_events: list | None = None
     people_hint: str = "none"
     action_hint: str = ""
     props_hint: str = "none"
@@ -55,7 +57,7 @@ def _get_yolo():
     try:
         from ultralytics import YOLO
 
-        _yolo = YOLO("yolov8n.pt")
+        _yolo = YOLO("yolo26n.pt")
     except Exception:  # noqa: BLE001
         _yolo = False
     return _yolo
@@ -239,11 +241,19 @@ def _bank_degrees(bgr: np.ndarray) -> float:
     return float(np.percentile(np.asarray(angles, dtype=np.float64), 75))
 
 
-def analyze_keyframes(images: list, bank_threshold_deg: float = 22.0) -> SceneSignals:
-    """Run YOLO person/prop detect + bank/under-object heuristics."""
-    signals = SceneSignals(prop_hits={})
+def analyze_keyframes(
+    images: list,
+    bank_threshold_deg: float = 22.0,
+    *,
+    times: list[float] | None = None,
+    duration_seconds: float = 0.0,
+) -> SceneSignals:
+    """Run YOLO person/prop detect + maneuver / under-object heuristics."""
+    signals = SceneSignals(prop_hits={}, move_tags=[], move_events=[])
     if not images:
         return signals
+
+    from .moves import detect_moves
 
     model = _get_yolo()
     banks: list[float] = []
@@ -297,6 +307,14 @@ def analyze_keyframes(images: list, bank_threshold_deg: float = 22.0) -> SceneSi
     signals.max_bank_deg = float(max(banks) if banks else 0.0)
     signals.max_foliage_score = float(max(foliage_scores) if foliage_scores else 0.0)
 
+    moves = detect_moves(
+        images, times=times, duration_seconds=duration_seconds
+    )
+    signals.move_tags = list(moves.tags)
+    signals.move_events = list(moves.events)
+    if moves.max_bank_deg > signals.max_bank_deg:
+        signals.max_bank_deg = moves.max_bank_deg
+
     if signals.frames_with_people > 0:
         if signals.frames_with_people >= 2 or signals.max_people_in_frame >= 2:
             signals.people_hint = (
@@ -312,8 +330,8 @@ def analyze_keyframes(images: list, bank_threshold_deg: float = 22.0) -> SceneSi
         signals.people_hint = "none"
 
     action_bits: list[str] = []
-    if signals.max_bank_deg >= 55 or signals.banked_frame_count >= 3:
-        action_bits.extend(["rolls", "flips", "banking"])
+    if moves.tags:
+        action_bits.extend(moves.tags)
     elif signals.max_bank_deg >= bank_threshold_deg or signals.banked_frame_count >= 1:
         action_bits.append("banking / aggressive turns")
 

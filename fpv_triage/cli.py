@@ -23,8 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--source",
-        required=False,
-        help="SD card or folder of videos (required unless --search/--rebuild-index)",
+        action="append",
+        default=None,
+        help=(
+            "SD card or folder of videos; repeat for a second source "
+            "(required unless --search/--rebuild-index)"
+        ),
     )
     p.add_argument("--output", required=True, help="PC folder for keeper copies")
     p.add_argument(
@@ -139,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.source:
         print("Error: --source is required for triage", file=sys.stderr)
         return 2
-    source = Path(args.source)
+    sources = [Path(p) for p in args.source]
     extensions = {
         e.strip().lower() if e.strip().startswith(".") else f".{e.strip().lower()}"
         for e in args.extensions.split(",")
@@ -154,7 +158,9 @@ def main(argv: list[str] | None = None) -> int:
         gap_seconds=args.gap_seconds,
     )
 
-    print(f"Scanning videos from {source}")
+    for i, source in enumerate(sources, start=1):
+        label = "Scanning videos from" if len(sources) == 1 else f"Source {i}"
+        print(f"{label} {source}")
     print(
         f"Keep rule: {config.proof_flight_seconds:.0f}s flight + "
         f"{config.remaining_after_proof:.0f}s remaining "
@@ -210,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         summary = run_triage(
-            source,
+            sources,
             output,
             config,
             copy_videos=copy_videos,
@@ -229,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             bar.close()
 
     if summary.scanned == 0:
-        print(f"No videos found under {source}")
+        listed = ", ".join(str(p) for p in sources)
+        print(f"No videos found under {listed}")
         return 1
 
     print()

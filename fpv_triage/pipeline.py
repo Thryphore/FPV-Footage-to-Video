@@ -14,7 +14,7 @@ from pathlib import Path
 from .analyzer import AnalyzerConfig, FlightAnalysis, analyze_video
 from .copier import copy_to_destination, reserve_destination
 from .describer import DEFAULT_MODEL_ID, VideoDescriber, write_notes_file
-from .scanner import find_videos
+from .scanner import SourceInput, find_videos, normalize_sources
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -97,7 +97,7 @@ def _reap_pending(
 
 
 def run_triage(
-    source: Path,
+    source: SourceInput,
     output: Path,
     config: AnalyzerConfig,
     *,
@@ -115,7 +115,8 @@ def run_triage(
     if dry_run is not None:
         copy_videos = not bool(dry_run)
 
-    videos = find_videos(source, extensions)
+    sources = normalize_sources(source)
+    videos = find_videos(sources, extensions)
     total = len(videos)
     describer: VideoDescriber | None = (
         VideoDescriber(model_id=model_id or DEFAULT_MODEL_ID) if describe else None
@@ -141,7 +142,8 @@ def run_triage(
             t_clip = time.perf_counter()
 
             t0 = time.perf_counter()
-            analysis = analyze_video(video, config)
+            # Full motion series only when describing — used for coolest 10% / crash.
+            analysis = analyze_video(video, config, full_motion=bool(describe))
             timing["analyze"] = time.perf_counter() - t0
 
             notes_path: str | None = None
@@ -167,8 +169,13 @@ def run_triage(
                 if describe and describer is not None:
                     if on_progress:
                         on_progress(index, total, f"Describing {video.name}")
+                    pace_tags: list[str] = []
+                    move_events: list = []
+                    coolest_window = None
+                    ends_in_crash = False
+                    crash_confidence = 0.0
                     try:
-                        notes = describer.describe(video)
+                        notes = describer.describe(video, analysis=analysis)
                         if notes.load_seconds > 0.05:
                             timing["model_load"] = notes.load_seconds
                         timing["keyframes"] = notes.keyframe_seconds
@@ -177,6 +184,11 @@ def run_triage(
                         analysis.people = notes.people
                         analysis.action = notes.action
                         analysis.description = notes.movement
+                        pace_tags = list(notes.pace_tags or [])
+                        move_events = list(notes.move_events or [])
+                        coolest_window = notes.coolest_window
+                        ends_in_crash = bool(notes.ends_in_crash)
+                        crash_confidence = float(notes.crash_confidence or 0.0)
                     except Exception as exc:  # noqa: BLE001
                         analysis.environment_tag = "unknown"
                         analysis.people = "none"
@@ -195,6 +207,11 @@ def run_triage(
                         action=analysis.action,
                         movement=analysis.description,
                         video_path=Path(copied_to) if copied_to else video,
+                        pace_tags=pace_tags,
+                        move_events=move_events,
+                        coolest_window=coolest_window,
+                        ends_in_crash=ends_in_crash,
+                        crash_confidence=crash_confidence,
                     )
                     notes_path = str(notes_file)
                     analysis.notes_path = notes_path
@@ -242,9 +259,11 @@ def run_triage(
 
     # Keep report order stable: rejects interleaved by scan order already;
     # pending keeps were appended when copies finished (still roughly ordered).
+    source_paths = [str(p.resolve()) for p in sources]
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "source": str(Path(source).resolve()),
+        "source": source_paths[0],
+        "sources": source_paths,
         "output": str(Path(output).resolve()),
         "copy_videos": bool(copy_videos),
         "dry_run": not bool(copy_videos),
